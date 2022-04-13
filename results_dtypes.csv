@@ -1,0 +1,7 @@
+,0
+job_id,object
+minsep,float64
+Deff_membrane,float64
+Deff_slot,float64
+phi_membrane,float64
+phi_slot,float64

@@ -1,0 +1,237 @@
+%YAML 1.2
+---
+#Set up logging
+- !ConfigLogging
+  stem: {{testname}}
+  level: TIMING
+#Add modules folder to python path
+- !PythonPathRequest
+  folders: [modules]
+#Folder Structure
+- !UpdateFolderStructure
+  OwnSolutionFile: [solutions, 0, 1, 2]
+  SiblingSolutionFile: [solutions, 0]
+  postprocfile: [postproc, 0]
+- !DumpFolderStructure
+  name: {{testname}}.dump_folder_structure
+  outfile: !SiblingSolutionFile folder_structure.yaml
+{#For each job#}
+{% for job in joblist.itertuples() %}
+{%set id=job.job_id%}
+#id={{id}}
+#Mesh Generation
+- !TemplateFileRequest
+  name: {{testname}}.geo.{{id}}
+  tmplfile: !geotemplate slot2d_inclusions.geo.jinja2
+  outfile: !geofile {{testname}}-{{id}}.geo
+  modules:
+    - !modulefile mesh.py
+  methods:
+    get_template_input: mesh_get_template_input
+  data:
+    mcar1: {{job.mcar1}}
+    mcar2: {{job.mcar2}}
+    mcar3: {{job.mcar3}}
+    mcar4: {{job.mcar4}}
+    S: {{job.S}}
+    d: {{job.d}}
+    H: {{job.H}}
+    slot_length: {{job.slot_length}}
+    inclusionlist: #[id, x, y, radius]
+      - [1000,{{job.inc1000_xcen}},0.0,1.0]
+      - [1100,{{job.inc1100_xcen}},0.0,1.0]
+    lattice:
+      incrad: {{job.incrad}} #Radius of the generated inclusions, nm
+      minsep: {{job.minsep}} #Minimum separation distance (surface-to-surface), nm
+      inc_id_start: 2000 #ID number for the first generated inclusion
+      inc_id_step: 100 #Change in ID number between generated inclusions
+      perturbation_rounds: {{job.perturbation_rounds}}
+      perturbation_stdev: {{job.perturbation_stdev}}
+- !GeoToHDF5Request
+  name: {{testname}}.mesh.{{id}}
+  mesh_stem: {{testname}}-{{id}}
+#Solve the Linearized Poisson-Boltzmann Equation
+- !LPBSimulator
+  name: {{testname}}.lpb.{{id}}
+  mesh: !mesh_hdf5file {{testname}}-{{id}}.hdf5
+  meshmeta: !meshmetafile {{testname}}-{{id}}.yaml
+  solver_parameters:
+    linear_solver: gmres
+    preconditioner: ilu
+  conditions:
+    elementorder: 2
+    kappa: 1.0
+    dirichlet: &potential_dirichlet_{{id}}
+      1: 0.0 #Left boundary
+      2: -0.025 #Right boundary
+  dataextraction:
+    - [writefield, {outfpath: !OwnSolutionFile potential.pvd}]
+    - [writefield, {outfpath: !OwnSolutionFile potential.hdf5, outname: potential}]
+    - - reportvalues
+      - outfpath: !OwnSolutionFile lpb_solvetime.yaml
+        mapping:
+          elapsed_time: sim_timer.delta_str
+#Solve the Smoluchowski Equation
+- !SUSimulator
+  &smol_basic_def_{{id}}
+  name: {{testname}}.smol.{{id}}.solve
+  mesh: !mesh_hdf5file {{testname}}-{{id}}.hdf5
+  meshmeta: !meshmetafile {{testname}}-{{id}}.yaml
+  modules:
+    - !modulefile simcalcs.py
+  methods:
+    - calc_ratio
+    - calc_delta
+    - effective_D
+    - free_volume_fraction
+  solver_parameters:
+    linear_solver: gmres
+    preconditioner: ilu
+  loaddata:
+    - [loadfield, {attrpath: potential, infpath: !SiblingSolutionFile lpb/{{id}}/potential.hdf5, fieldtag: potential}]
+  conditions:
+    elementorder: 2
+    dirichlet:
+      1: [1.0] #Left boundary
+      2: [0.0] #Right boundary
+    species:
+      - {symbol: A, z: 1.0, D: 0.008}
+    beta: 1.0
+    potential_dirichlet: *potential_dirichlet_{{id}}
+  dataextraction:
+    - [writefield, {outfpath: !OwnSolutionFile soln.hdf5, attrpath: soln, outname: soln}]
+    - [transform_back, {}]
+    - [calcflux, {solnattr: solnlist, idx: 0, attrpath: flux_A}]
+    - [writefield, {outfpath: !OwnSolutionFile conc_A.hdf5, attrpath: clist, idx: 0, outname: conc_A}]
+    - [writefield, {outfpath: !OwnSolutionFile flux_A.hdf5, attrpath: flux_A, outname: flux_A}]
+    - - reportvalues
+      - outfpath: !OwnSolutionFile smol_solvetime.yaml
+        mapping:
+          elapsed_time: sim_timer.delta_str
+#Extract the data
+- !SUSimulator
+  <<: *smol_basic_def_{{id}}
+  name: {{testname}}.smol.{{id}}.extract
+  skipsolve: True
+  metadata:
+    job_id: "{{job.job_id}}"
+    minsep: {{job.minsep}}
+  loaddata:
+    - [loadfield, {attrpath: potential, infpath: !SiblingSolutionFile lpb/{{id}}/potential.hdf5, fieldtag: potential}]
+    - [loadfield, {attrpath: soln, infpath: !OwnSolutionFile soln.hdf5, fieldtag: soln}]
+    - [newfunction, {attrpath: conc_A, spaceattr: V_scalar, funcname: conc_A}]
+    - [newfunction, {attrpath: flux_A, spaceattr: V_vec, funcname: flux_A}]
+    - [loadfield, {attrpath: conc_A, infpath: !OwnSolutionFile conc_A.hdf5, fieldtag: conc_A}]
+    - [loadfield, {attrpath: flux_A, infpath: !OwnSolutionFile flux_A.hdf5, fieldtag: flux_A}]
+  dataextraction:
+    - [writefield, {outfpath: !OwnSolutionFile conc_A.pvd, attrpath: conc_A}]
+    - [writefield, {outfpath: !OwnSolutionFile flux_A.pvd, attrpath: flux_A}]
+    - [fluxintegral, {fluxattr: flux_A, pfacet: 5, attrpath: totflux_A_pore, internal: True, fluxsign: '-'}]
+    - [calc_delta, {vmin: !Stored meshinfo.metadata.X1, vmax: !Stored meshinfo.metadata.X5, outattr: cell_delta_x}]
+    - [calc_delta, {vmin: !Stored meshinfo.metadata.X2, vmax: !Stored meshinfo.metadata.X4, outattr: slot_delta_x}]
+    - [facet_area, {pfacet: 5, attrpath: area_mid, internal: True}]
+    - [facet_integral, {pfacet: 3, attrpath: int_conc_left, funcpath: conc_A, internal: True}]
+    - [facet_integral, {pfacet: 4, attrpath: int_conc_right, funcpath: conc_A, internal: True}]
+    - [calc_ratio, {numerator: !Stored int_conc_left, denominator: !Stored meshinfo.metadata.d, outattr: avg_conc_left}]
+    - [calc_ratio, {numerator: !Stored int_conc_right, denominator: !Stored meshinfo.metadata.d, outattr: avg_conc_right}]
+    - - effective_D
+      - outattr: Deff_membrane #The effective diffusion coefficient of the membrane
+        fluxattr: totflux_A_pore
+        areaattr: [meshinfo, metadata, S]
+        start_conc_attr: avg_conc_left #[conditions, dirichlet, 1, 0]
+        end_conc_attr: avg_conc_right #[conditions, dirichlet, 2, 0]
+        delta_s_attr: slot_delta_x #cell_delta_x
+    - - effective_D
+      - outattr: Deff_slot #The effective diffusion coefficient for the slot itself
+        fluxattr: totflux_A_pore
+        areaattr: area_mid #[meshinfo, metadata, d]
+        start_conc_attr: avg_conc_left
+        end_conc_attr: avg_conc_right
+        delta_s_attr: slot_delta_x
+    - - free_volume_fraction
+      - outattr: phi_membrane
+        pcells: [3, 4]
+        dimensions: [!Stored meshinfo.metadata.slot_length, !Stored meshinfo.metadata.S]
+    - - free_volume_fraction
+      - outattr: phi_slot
+        pcells: [3, 4]
+        dimensions: [!Stored meshinfo.metadata.slot_length, !Stored meshinfo.metadata.d]
+    # - [fluxintegral, {fluxattr: flux_A, pfacet: 1000, attrpath: totflux_A_1000}]
+    # - [fluxintegral, {fluxattr: flux_A, pfacet: 1100, attrpath: totflux_A_1100}]
+    - - reportvalues
+      - outfpath: !OwnSolutionFile info.yaml
+        mapping:
+          job_id: metadata.job_id
+          minsep: metadata.minsep
+          totflux_A_pore: totflux_A_pore
+          # totflux_A_1000: totflux_A_1000
+          # totflux_A_1100: totflux_A_1100
+          elapsed_time: sim_timer.delta_str
+          D_bulk_A: [conditions, species, 0, D]
+          left_conc_A: [conditions, dirichlet, 1, 0]
+          right_conc_A: [conditions, dirichlet, 2, 0]
+          cell_delta_x: cell_delta_x
+          area_mid: area_mid
+          Deff_membrane: Deff_membrane
+          Deff_slot: Deff_slot
+          full_area: [meshinfo, metadata, S]
+          avg_conc_left: avg_conc_left
+          avg_conc_right: avg_conc_right
+          phi_membrane: phi_membrane
+          phi_slot: phi_slot
+    - [new_odict, {dpath: plots}]
+    - [line_profile, {startloc: [X1,Y3], endloc: [X5,Y3], num: 1000, indep: 0, plotpath: plots.CL_A, label: 'concentration of A along centerline', attrpath: conc_A}]
+    - [save_pickle, {attrpath: plots, outfpath: !OwnSolutionFile plots.pkl}]
+{%endfor%}{#for job#}
+
+# Collection
+- !RawCollectionRequest
+  name: {{testname}}.collection
+  outpath: !postprocfile results.pkl
+  calculations:
+    - [save_csv, {attrpath: df, outfpath: !postprocfile results.csv, dtype_csv_fpath: !postprocfile results_dtypes.csv}]
+  definitions:
+    - mapping:
+        job_id: job_id
+        minsep: minsep
+        Deff_membrane: Deff_membrane
+        Deff_slot: Deff_slot
+        phi_membrane: phi_membrane
+        phi_slot: phi_slot
+      file_list:
+{% for job in joblist.itertuples() %}
+        - !DataFile solutions/{{testname}}/smol/{{job.job_id}}/info.yaml
+{% endfor %}{#for job#}
+
+# Plotting
+- !FigureRequest
+  name: {{testname}}.plot
+  #loadfiles:
+  #  dframe: !postprocfile results.pkl #We can't load the dtypes this way.
+  prepcommands:
+    - [load_csv, {infpath: !postprocfile results.csv, attrpath: dframe, dtype_csv_fpath: !postprocfile results_dtypes.csv}]
+    - [series_from_dataframe, {dfpath: dframe, xcol: minsep, ycol: Deff_membrane, outattr: series_1, label: "$D_{eff}$"}]
+  rcparams:
+    figure.dpi: 300
+    figure.autolayout: False
+  figures:
+    - !FigureProperties
+      figsize: [8,5]
+      outfpath: !postprocfile plot.png
+  axes:
+    - !AxesProperties
+      xlabel:
+        xlabel: 'Minimum separation distance [nm]'
+        fontsize: 20
+      ylabel:
+        ylabel: '$D_{eff}$'
+        fontsize: 20
+      #xlim: [30,60]
+      ylim: [0.0,1.0]
+  series:
+    - !SeriesProperties
+      seriesattr: series_1
+      fmt: "ko"
+  plotcommands:
+    - [axmethod, {method: legend, loc: "center left", numpoints: 1, bbox_to_anchor: [1, 0.5]}] 
+    #- [figmethod, {method: subplots_adjust, bottom: 0.15, left: 0.1, right: 0.7}]
